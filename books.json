@@ -1,0 +1,68 @@
+[
+  {
+    "id": 1,
+    "title": "Muhandislik matematika asoslari",
+    "author": "S. Isroilov",
+    "category": "Ta'lim",
+    "year": 2019,
+    "image": "https://images.unsplash.com/photo-1519681393784-d120267933ba?auto=format&fit=crop&w=400&q=80",
+    "ad_text": "Murakkab konseptlarni sodda til bilan tushuntiradi — imtihonlarga mukammal tayyorgarlik.",
+    "prices": {"7": 12000, "14": 20000, "30": 35000, "60": 60000},
+    "status": "available"
+  },
+  {
+    "id": 2,
+    "title": "Python: Amaliy loyihalar",
+    "author": "L. Usmonova",
+    "category": "Dasturlash",
+    "year": 2021,
+    "image": "https://images.unsplash.com/photo-1555066931-4365d14bab8c?auto=format&fit=crop&w=400&q=80",
+    "ad_text": "Real-world loyihalar orqali Pythonni o'rganing — kod yozing, natija ko'ring.",
+    "prices": {"7": 15000, "14": 26000, "30": 42000, "60": 75000},
+    "status": "available"
+  },
+  {
+    "id": 3,
+    "title": "Shaxsiy moliya va investitsiyalar",
+    "author": "A. Qodirov",
+    "category": "Biznes",
+    "year": 2018,
+    "image": "https://images.unsplash.com/photo-1554224154-22dec7ec8818?auto=format&fit=crop&w=400&q=80",
+    "ad_text": "Pulingizni qanday ko'paytirish va xavfsiz investitsiyalarni tanlash bo'yicha amaliy qo'llanma.",
+    "prices": {"7": 10000, "14": 18000, "30": 30000, "60": 55000},
+    "status": "available"
+  },
+  {
+    "id": 4,
+    "title": "Samarali o'qish va eslab qolish texnikalari",
+    "author": "M. Karimova",
+    "category": "O'z-o'zini rivojlantirish",
+    "year": 2020,
+    "image": "https://images.unsplash.com/photo-1515378791036-0648a3ef77b2?auto=format&fit=crop&w=400&q=80",
+    "ad_text": "O'qish samaradorligini oshirish uchun tez eslab qolish va organizatsiya usullari.",
+    "prices": {"7": 9000, "14": 16000, "30": 28000, "60": 50000},
+    "status": "available"
+  },
+  {
+    "id": 5,
+    "title": "Ishbilarmon nutq va taqdimot san'ati",
+    "author": "D. Rasulov",
+    "category": "Biznes",
+    "year": 2017,
+    "image": "https://images.unsplash.com/photo-1521737604893-d14cc237f11d?auto=format&fit=crop&w=400&q=80",
+    "ad_text": "O'zingizni ishonchli tuting — taqdimot va suhbatlarda muvaffaqiyat qozonish sirlari.",
+    "prices": {"7": 11000, "14": 19000, "30": 33000, "60": 59000},
+    "status": "available"
+  },
+  {
+    "id": 6,
+    "title": "Iqtisodiyotning asosiy tamoyillari",
+    "author": "N. Tursunov",
+    "category": "Ta'lim",
+    "year": 2016,
+    "image": "https://images.unsplash.com/photo-1503676260728-1c00da094a0b?auto=format&fit=crop&w=400&q=80",
+    "ad_text": "Oddiy tilda iqtisodiyot nazariyasi va amaliyoti — kundalik qarorlar uchun foydali.",
+    "prices": {"7": 8000, "14": 14000, "30": 26000, "60": 48000},
+    "status": "available"
+  }
+]
