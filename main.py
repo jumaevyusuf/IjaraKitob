@@ -6,7 +6,6 @@ import json
 import os
 import re
 import signal
-import shutil
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -20,7 +19,7 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -38,21 +37,15 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder
 # Load .env from project root before any config-dependent imports
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _ENV_PATH = _PROJECT_ROOT / ".env"
-_ENV_EXAMPLE = _PROJECT_ROOT / ".env.example"
-if not _ENV_PATH.exists() and _ENV_EXAMPLE.exists():
-    try:
-        shutil.copy(_ENV_EXAMPLE, _ENV_PATH)
-    except Exception:
-        pass
-load_dotenv(_ENV_PATH)
+if _ENV_PATH.exists():
+    # Local development convenience only. In production (Render), set env vars in dashboard.
+    load_dotenv(_ENV_PATH, override=False)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logger.info(".env loaded from: %s", _ENV_PATH.resolve())
+logger.info(".env present=%s", _ENV_PATH.exists())
 
 BASE_DIR = _PROJECT_ROOT
-ENV_FILE = _ENV_PATH
-ENV_EXAMPLE = _ENV_EXAMPLE
 
 import db
 from config import ADMIN_IDS, is_admin
@@ -200,13 +193,13 @@ BROADCAST_MAX_USERS = 500
 
 # ====== Keyboards ======
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
-    builder = ReplyKeyboardBuilder()
-    builder.row(
+    b = ReplyKeyboardBuilder()
+    b.row(
         KeyboardButton(text="📚 Kitoblar"),
         KeyboardButton(text="ℹ️ Qoidalar"),
     )
-    builder.row(KeyboardButton(text="📖 Mening ijaralarim"))
-    return builder.as_markup(resize_keyboard=True)
+    b.row(KeyboardButton(text="📖 Mening ijaralarim"))
+    return b.as_markup(resize_keyboard=True)
 
 
 def admin_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -403,6 +396,80 @@ def admin_rentals_keyboard(rentals: list) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _rental_status_uz(st: str) -> str:
+    return {
+        "requested": "⏳ So'rov",
+        "approved": "✅ Tasdiqlangan",
+        "active": "📖 Faol",
+        "rejected": "❌ Rad etilgan",
+        "returned": "✅ Qaytarilgan",
+    }.get(st or "", st or "?")
+
+
+def _days_late(due_ts: str | None, now_dt: datetime) -> int:
+    if not due_ts:
+        return 0
+    try:
+        due_dt = datetime.fromisoformat(str(due_ts)[:10] + "T00:00:00+00:00")
+    except Exception:
+        return 0
+    return max(0, (now_dt - due_dt).days)
+
+
+async def cb_rental_detail(callback: CallbackQuery):
+    """Admin rental detail view for rental_{id} buttons."""
+    data = callback.data or ""
+    if not data.startswith("rental_"):
+        await callback.answer()
+        return
+    # Guard against other rental_* callbacks
+    if data.startswith(("rental_ok_", "rental_no_", "rental_return_")):
+        await callback.answer()
+        return
+    try:
+        rental_id = int(data.replace("rental_", ""))
+    except ValueError:
+        await callback.answer("Xatolik.")
+        return
+    rental = db.get_rental(rental_id)
+    if not rental:
+        await callback.answer("Ijara topilmadi.", show_alert=True)
+        return
+    now = datetime.now(timezone.utc)
+    due = (rental.get("due_ts") or "")[:10] or "—"
+    start = (rental.get("start_ts") or "")[:19] or "—"
+    returned = (rental.get("returned_at") or "")[:19] or "—"
+    late_days = _days_late(rental.get("due_ts"), now if rental.get("status") != "returned" else now)
+    penalty = db.compute_penalty(rental, now)
+    penalty_line = f"\n💰 Jarima: {penalty:,} so'm" if penalty > 0 else ""
+
+    text = (
+        f"📄 <b>Ijara tafsiloti</b>\n\n"
+        f"🆔 ID: <code>{rental_id}</code>\n"
+        f"👤 User ID: <code>{rental.get('user_id')}</code>\n"
+        f"📕 Kitob: {html.escape(rental.get('book_title') or '?')} — {html.escape(rental.get('book_author') or '?')}\n"
+        f"📌 Status: {_rental_status_uz(rental.get('status', ''))}\n"
+        f"⏱ Boshlangan: {start}\n"
+        f"📅 Muddat: {due}\n"
+        f"↩️ Qaytarildi: {returned}\n"
+        f"⏳ Kechikdi: {late_days} kun"
+        f"{penalty_line}\n"
+    )
+
+    rows = []
+    st = rental.get("status")
+    if st == "requested":
+        rows.append([
+            InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"rental_ok_{rental_id}"),
+            InlineKeyboardButton(text="❌ Rad etish", callback_data=f"rental_no_{rental_id}"),
+        ])
+    elif st in ("approved", "active"):
+        rows.append([InlineKeyboardButton(text="✅ Qaytarildi", callback_data=f"rental_return_{rental_id}")])
+    rows.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin_rentals")])
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
 def rental_period_keyboard(book_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -424,29 +491,37 @@ async def cmd_start(message: Message):
 
 
 async def show_rules(message: Message):
-    text = (
-        "ℹ️ <b>Ijara qoidalari:</b>\n\n"
-        "• Muddat: 7, 14 yoki 30 kun.\n"
-        "• Kitobni muddatida qaytarish majburiy.\n"
-        "• Zarar yoki yo'qotishda javobgarlik sizda.\n"
-        "• Savollar uchun admin bilan bog'laning."
-    )
-    await message.answer(text, reply_markup=main_menu_keyboard())
+    try:
+        text = (
+            "ℹ️ <b>Ijara qoidalari:</b>\n\n"
+            "• Muddat: 7, 14 yoki 30 kun.\n"
+            "• Kitobni muddatida qaytarish majburiy.\n"
+            "• Zarar yoki yo'qotishda javobgarlik sizda.\n"
+            "• Savollar uchun admin bilan bog'laning."
+        )
+        await message.answer(text, reply_markup=main_menu_keyboard())
+    except Exception:
+        logger.exception("show_rules failed")
+        await message.answer("Xatolik chiqdi, /start ni qayta bosing.")
 
 
 async def show_books_menu(message: Message):
     """Show categories and search for books."""
-    cats = db.get_categories()
-    if not cats:
-        await message.answer("Hozircha kitoblar mavjud emas.", reply_markup=main_menu_keyboard())
-        return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=c, callback_data=f"cat_{c}")] for c in cats
-    ] + [
-        [InlineKeyboardButton(text="📚 Barcha kitoblar", callback_data="cat_all")],
-        [InlineKeyboardButton(text="🔎 Qidiruv", callback_data="books_search")],
-    ])
-    await message.answer("📚 Kitoblar yoki kategoriyani tanlang:", reply_markup=kb)
+    try:
+        cats = db.get_categories()
+        if not cats:
+            await message.answer("Hozircha kitoblar mavjud emas.", reply_markup=main_menu_keyboard())
+            return
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=c, callback_data=f"cat_{c}")] for c in cats
+        ] + [
+            [InlineKeyboardButton(text="📚 Barcha kitoblar", callback_data="cat_all")],
+            [InlineKeyboardButton(text="🔎 Qidiruv", callback_data="books_search")],
+        ])
+        await message.answer("📚 Kitoblar yoki kategoriyani tanlang:", reply_markup=kb)
+    except Exception:
+        logger.exception("show_books_menu failed")
+        await message.answer("Xatolik chiqdi, /start ni qayta bosing.", reply_markup=main_menu_keyboard())
 
 
 async def cb_books_cat(callback: CallbackQuery):
@@ -660,7 +735,10 @@ async def cb_rental_period(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     try:
-        _, book_id_str, days_str = data.split("_")
+        parts = data.split("_")
+        if len(parts) != 3:
+            raise ValueError("bad callback format")
+        _, book_id_str, days_str = parts
         book_id = int(book_id_str)
         days = int(days_str)
     except (ValueError, IndexError):
@@ -702,31 +780,35 @@ async def cb_rental_period(callback: CallbackQuery, state: FSMContext):
 
 
 async def my_rentals(message: Message):
-    rentals = [r for r in db.list_rentals() if r.get("user_id") == message.from_user.id]
-    if not rentals:
-        await message.answer("Sizda hozircha ijaralar yo'q.", reply_markup=main_menu_keyboard())
-        return
-    text = "📖 <b>Sizning ijaralaringiz:</b>\n\n"
-    now = datetime.now(timezone.utc)
-    for r in rentals:
-        status = r.get("status", "?")
-        status_uz = {
-            "requested": "⏳ Ko'rilmoqda",
-            "approved": "✅ Tasdiqlangan",
-            "active": "📖 Faol",
-            "rejected": "❌ Rad etilgan",
-            "returned": "Qaytarilgan ✅",
-        }.get(status, status)
-        text += f"• {r.get('book_title', '?')} — {status_uz}\n"
-        text += f"  Qaytarish: {r.get('due_ts', '?')}"
-        if r.get("returned_at"):
-            text += f"\n  Qaytarildi: {r.get('returned_at', '')[:10]}"
-        if status in ("active", "approved"):
-            penalty = db.compute_penalty(r, now)
-            if penalty > 0:
-                text += f"\n  Jarima: {penalty:,} so'm"
-        text += "\n\n"
-    await message.answer(text, reply_markup=main_menu_keyboard(), parse_mode=ParseMode.HTML)
+    try:
+        rentals = [r for r in db.list_rentals() if r.get("user_id") == message.from_user.id]
+        if not rentals:
+            await message.answer("Sizda hozircha ijaralar yo'q.", reply_markup=main_menu_keyboard())
+            return
+        text = "📖 <b>Sizning ijaralaringiz:</b>\n\n"
+        now = datetime.now(timezone.utc)
+        for r in rentals:
+            status = r.get("status", "?")
+            status_uz = {
+                "requested": "⏳ Ko'rilmoqda",
+                "approved": "✅ Tasdiqlangan",
+                "active": "📖 Faol",
+                "rejected": "❌ Rad etilgan",
+                "returned": "Qaytarilgan ✅",
+            }.get(status, status)
+            text += f"• {r.get('book_title', '?')} — {status_uz}\n"
+            text += f"  Qaytarish: {r.get('due_ts', '?')}"
+            if r.get("returned_at"):
+                text += f"\n  Qaytarildi: {r.get('returned_at', '')[:10]}"
+            if status in ("active", "approved"):
+                penalty = db.compute_penalty(r, now)
+                if penalty > 0:
+                    text += f"\n  Jarima: {penalty:,} so'm"
+            text += "\n\n"
+        await message.answer(text, reply_markup=main_menu_keyboard(), parse_mode=ParseMode.HTML)
+    except Exception:
+        logger.exception("my_rentals failed")
+        await message.answer("Xatolik chiqdi, /start ni qayta bosing.", reply_markup=main_menu_keyboard())
 
 
 # ====== Admin Handlers ======
@@ -1212,9 +1294,12 @@ async def cb_penalty_edit(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     parts = data.replace("penalty_edit_", "").split("_")
+    if len(parts) < 2:
+        await callback.answer("Xatolik.")
+        return
     try:
         rental_id = int(parts[0])
-        from_page = int(parts[1]) if len(parts) > 1 else 1
+        from_page = int(parts[1])
     except (ValueError, IndexError):
         await callback.answer("Xatolik.")
         return
@@ -2155,7 +2240,7 @@ async def cb_rental_ok(callback: CallbackQuery):
     admin_id = callback.from_user.id if callback.from_user else 0
     ok, reason = db.approve_rental_if_available(rental_id, admin_id)
     if not ok:
-        if reason == "no_stock":
+        if reason == "not_available":
             # Mark as rejected so it doesn't stay pending.
             db.set_rental_status(rental_id, "rejected")
             try:
@@ -2166,7 +2251,7 @@ async def cb_rental_ok(callback: CallbackQuery):
             except Exception as e:
                 logger.warning("User notify failed: %s", e)
             await callback.answer("❌ Nusxa qolmagan", show_alert=True)
-        elif reason == "db_locked":
+        elif reason == "locked":
             await callback.answer("⏳ Band. Qayta urinib ko'ring.", show_alert=True)
         else:
             await callback.answer("Bu so'rov allaqachon ko'rib chiqilgan.", show_alert=True)
@@ -2347,7 +2432,61 @@ async def _log_incoming_update(handler, event: Update, data: dict):
     return await handler(event, data)
 
 
-_PRIVATE = F.chat.type == ChatType.PRIVATE
+async def _global_error_handler(event) -> bool:
+    """Last-resort error handler: log and reply safely."""
+    exc = getattr(event, "exception", None)
+    logger.error("Unhandled exception", exc_info=exc)
+
+    # Try to respond to user/admin without crashing if markup fails.
+    update = getattr(event, "update", None)
+    msg = getattr(update, "message", None) if update else None
+    cq = getattr(update, "callback_query", None) if update else None
+
+    text = "Xatolik yuz berdi. /start ni qayta bosing."
+    try:
+        if msg:
+            try:
+                await msg.answer(text, reply_markup=main_menu_keyboard())
+            except Exception:
+                await msg.answer(text)
+        elif cq and getattr(cq, "message", None):
+            try:
+                await cq.message.answer(text, reply_markup=main_menu_keyboard())
+            except Exception:
+                await cq.message.answer(text)
+            try:
+                await cq.answer("Xatolik.", show_alert=True)
+            except Exception:
+                pass
+    except Exception:
+        # Never allow error handler to crash polling loop.
+        pass
+    return True
+
+
+class ChatTypeFilter(BaseFilter):
+    """Minimal ChatTypeFilter for aiogram v3 (Message/CallbackQuery)."""
+
+    def __init__(self, chat_type: list[str]):
+        self._chat_types = {str(x) for x in chat_type}
+
+    async def __call__(self, event, **kwargs) -> bool:
+        chat = getattr(event, "chat", None)
+        if chat is None and getattr(event, "message", None):
+            chat = getattr(event.message, "chat", None)
+        t = getattr(chat, "type", None)
+        t_val = getattr(t, "value", str(t)) if t is not None else ""
+        return t_val in self._chat_types
+
+
+_PRIVATE = ChatTypeFilter(chat_type=["private"])
+
+
+async def fallback_private(message: Message):
+    await message.answer(
+        "Tushunmadim. Menyudan tanlang yoki /start bosing.",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 async def reminder_loop(bot: Bot) -> None:
@@ -2420,13 +2559,18 @@ async def reminder_loop(bot: Bot) -> None:
 
 
 def setup_router(dp: Dispatcher) -> None:
+    # Global error handler (must be registered first)
+    dp.errors.register(_global_error_handler)
+
     dp.message.register(cmd_start, CommandStart(), _PRIVATE)
     dp.message.register(cmd_admin, Command("admin"), _PRIVATE, AdminOnly())
     dp.message.register(cmd_wipe_all, Command("wipe_all"), _PRIVATE, AdminOnly())
     dp.message.register(cmd_set_order, Command("set_order"), _PRIVATE, AdminOnly())
-    dp.message.register(show_rules, F.text == "ℹ️ Qoidalar", _PRIVATE)
-    dp.message.register(show_books_menu, F.text == "📚 Kitoblar", _PRIVATE)
-    dp.message.register(my_rentals, F.text == "📖 Mening ijaralarim", _PRIVATE)
+
+    # Main menu buttons (must be registered before any catch-all fallbacks)
+    dp.message.register(show_books_menu, _PRIVATE, F.text == "📚 Kitoblar")
+    dp.message.register(show_rules, _PRIVATE, F.text == "ℹ️ Qoidalar")
+    dp.message.register(my_rentals, _PRIVATE, F.text == "📖 Mening ijaralarim")
     # Admin ReplyKeyboard buttons
     dp.message.register(admin_add_book_msg, F.text == "➕ Kitob qo'shish", _PRIVATE, AdminOnly())
     dp.message.register(admin_books_msg, F.text == "📚 Kitoblarim", _PRIVATE, AdminOnly())
@@ -2495,6 +2639,7 @@ def setup_router(dp: Dispatcher) -> None:
     dp.callback_query.register(cb_rental_ok, F.data.startswith("rental_ok_"), AdminOnly())
     dp.callback_query.register(cb_rental_no, F.data.startswith("rental_no_"), AdminOnly())
     dp.callback_query.register(cb_rental_return, F.data.startswith("rental_return_"), AdminOnly())
+    dp.callback_query.register(cb_rental_detail, F.data.startswith("rental_"), AdminOnly())
     dp.callback_query.register(cb_overdue_ping, F.data.startswith("overdue_ping_"), AdminOnly())
     dp.callback_query.register(admin_overdue_page, F.data.startswith("overdue_p_"), AdminOnly())
     dp.callback_query.register(cb_penalty_edit, F.data.startswith("penalty_edit_"), AdminOnly())
@@ -2530,31 +2675,22 @@ def setup_router(dp: Dispatcher) -> None:
     # Unhandled text: greetings -> warm reply; other -> friendly fallback
     _NON_CMD = F.text & ~F.text.startswith("/")
     dp.message.register(unhandled_text_handler, _NON_CMD, _PRIVATE)
-    # Fallback: no text (photo, sticker, etc.)
-    dp.message.register(fallback_handler, _PRIVATE)
+    # Very last resort: never silent in private chat
+    dp.message.register(fallback_private, _PRIVATE)
 
 
 async def main():
     raw = os.getenv("BOT_TOKEN", "") or ""
     token = raw.strip().strip("'\"")
     if not token:
-        raise RuntimeError(
-            "BOT_TOKEN muhiti o'zgaruvchisi (environment variable) o'rnatilmagan yoki bo'sh. "
-            ".env faylida BOT_TOKEN=... qo'shing."
-        )
+        raise RuntimeError("BOT_TOKEN is missing. Set it in environment variables.")
     _token_re = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{30,}$")
     _regex_ok = bool(_token_re.match(token))
-    _env_exists = "BOT_TOKEN" in os.environ
-    _id_prefix = token.split(":")[0][:3] if ":" in token else ""
-    _tail = token[-2:] if len(token) >= 2 else ""
-    logger.info(
-        "BOT_TOKEN loaded=%s len=%d has_colon=%s regex_ok=%s id_prefix=%s tail=%s",
-        _env_exists, len(token), ":" in token, _regex_ok, _id_prefix, _tail,
-    )
+    logger.info("BOT_TOKEN present=%s regex_ok=%s", True, _regex_ok)
     if not _regex_ok:
         raise RuntimeError(
             "BOT_TOKEN format invalid. Expected: digits:alphanumeric (e.g. 123456789:ABC...). "
-            "Get token from @BotFather and set in .env as BOT_TOKEN=..."
+            "Get token from @BotFather and set it in environment variables."
         )
 
     create_lock()

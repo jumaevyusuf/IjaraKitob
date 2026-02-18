@@ -1,6 +1,7 @@
 """SQLite database for kitob ijara bot."""
 import os
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -9,17 +10,55 @@ BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "bot.db"
 
 
+def _get_db_timeout_seconds() -> float:
+    """SQLite connection timeout seconds (env DB_TIMEOUT, default 10)."""
+    raw = (os.getenv("DB_TIMEOUT", "") or "").strip()
+    if not raw:
+        return 10.0
+    try:
+        v = float(raw)
+        return 10.0 if v <= 0 else v
+    except ValueError:
+        return 10.0
+
+
+def _write_retry(callable_fn, *, attempts: int = 5) -> Any:
+    """Retry helper for write ops hitting 'database is locked'.
+
+    Backoff (seconds): 0.05, 0.1, 0.2, 0.4, 0.8 (max 5 attempts).
+    Only retries sqlite3.OperationalError containing 'locked'.
+    """
+    delays = (0.05, 0.1, 0.2, 0.4, 0.8)
+    last_err: Optional[Exception] = None
+    for i in range(max(1, attempts)):
+        try:
+            return callable_fn()
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            if "locked" not in msg:
+                raise
+            last_err = e
+            if i >= len(delays):
+                break
+            time.sleep(delays[i])
+    # Re-raise last locked error if we ran out of retries.
+    if last_err:
+        raise last_err
+    raise sqlite3.OperationalError("database is locked")
+
+
 def _get_conn() -> sqlite3.Connection:
     # Reliability tweaks:
     # - timeout=10: reduce 'database is locked' errors under concurrent access
     # - check_same_thread=False: allow use across async callbacks/threads safely per-connection
-    conn = sqlite3.connect(DB_PATH, timeout=10.0, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, timeout=_get_db_timeout_seconds(), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     # PRAGMAs are per-connection; keep them lightweight and consistent.
     try:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
     except Exception:
         # If WAL isn't supported (e.g. some environments), continue with defaults.
         pass
@@ -70,70 +109,75 @@ def approve_rental_if_available(rental_id: int, admin_id: int) -> tuple[bool, st
 
     Returns:
       (True, "ok") on success
-      (False, "no_stock") if no copies available
-      (False, "not_found") if rental does not exist
-      (False, "not_pending") if rental already processed
-      (False, "book_missing") if book row missing
-      (False, "db_locked") if cannot acquire transaction lock
+      (False, "not_found") if rental does not exist (or book row missing)
+      (False, "wrong_status") if rental already processed
+      (False, "not_available") if no copies available
+      (False, "locked") if database is locked (after retries)
     """
-    conn = _get_conn()
-    # We want explicit transaction control for BEGIN IMMEDIATE.
-    conn.isolation_level = None  # autocommit mode
-    try:
+    def _op() -> tuple[bool, str]:
+        conn = _get_conn()
+        # We want explicit transaction control for BEGIN IMMEDIATE.
+        conn.isolation_level = None  # autocommit mode
         try:
             conn.execute("BEGIN IMMEDIATE")
-        except sqlite3.OperationalError:
-            return False, "db_locked"
 
-        cur = conn.execute(
-            "SELECT id, user_id, book_id, status, due_ts FROM rentals WHERE id = ?",
-            (rental_id,),
-        )
-        rental = cur.fetchone()
-        if not rental:
-            conn.execute("ROLLBACK")
-            return False, "not_found"
-        if rental["status"] != "requested":
-            conn.execute("ROLLBACK")
-            return False, "not_pending"
+            cur = conn.execute(
+                "SELECT id, book_id, status FROM rentals WHERE id = ?",
+                (rental_id,),
+            )
+            rental = cur.fetchone()
+            if not rental:
+                conn.execute("ROLLBACK")
+                return False, "not_found"
+            if rental["status"] != "requested":
+                conn.execute("ROLLBACK")
+                return False, "wrong_status"
 
-        cur = conn.execute("SELECT qty FROM books WHERE id = ?", (rental["book_id"],))
-        b = cur.fetchone()
-        if not b:
-            conn.execute("ROLLBACK")
-            return False, "book_missing"
-        total_qty = int(b[0] or 0)
+            # Compute availability inside the same transaction.
+            cur = conn.execute("SELECT qty FROM books WHERE id = ?", (rental["book_id"],))
+            b = cur.fetchone()
+            if not b:
+                conn.execute("ROLLBACK")
+                return False, "not_found"
+            total_qty = int(b[0] or 0)
 
-        cur = conn.execute(
-            "SELECT COUNT(*) FROM rentals WHERE book_id = ? AND status IN ('approved', 'active')",
-            (rental["book_id"],),
-        )
-        active = int(cur.fetchone()[0] or 0)
-        available = total_qty - active
-        if available <= 0:
-            conn.execute("ROLLBACK")
-            return False, "no_stock"
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM rentals WHERE book_id = ? AND status IN ('approved', 'active')",
+                (rental["book_id"],),
+            )
+            active = int(cur.fetchone()[0] or 0)
+            available = total_qty - active
+            if available <= 0:
+                conn.execute("ROLLBACK")
+                return False, "not_available"
 
-        now_iso = datetime.now(timezone.utc).isoformat()
-        cur = conn.execute(
-            "UPDATE rentals SET status = 'approved', start_ts = ?, approved_by_admin_id = ? "
-            "WHERE id = ? AND status = 'requested'",
-            (now_iso, admin_id, rental_id),
-        )
-        if cur.rowcount <= 0:
-            conn.execute("ROLLBACK")
-            return False, "not_pending"
+            now_iso = datetime.now(timezone.utc).isoformat()
+            cur = conn.execute(
+                "UPDATE rentals SET status = 'approved', start_ts = ?, approved_by_admin_id = ? "
+                "WHERE id = ? AND status = 'requested'",
+                (now_iso, admin_id, rental_id),
+            )
+            if cur.rowcount <= 0:
+                conn.execute("ROLLBACK")
+                return False, "wrong_status"
 
-        conn.execute("COMMIT")
-        return True, "ok"
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
+            conn.execute("COMMIT")
+            return True, "ok"
         except Exception:
-            pass
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    try:
+        return _write_retry(_op)
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e).lower():
+            return False, "locked"
         raise
-    finally:
-        conn.close()
 
 
 def _create_rental_notifications_table(conn: sqlite3.Connection) -> None:
@@ -197,6 +241,12 @@ def init_db() -> None:
         _migrate_rentals_schema(conn)
         _create_rental_notifications_table(conn)
         _create_settings_table(conn)
+        # Indexes (idempotent) — improves stock/overdue queries and reduces lock duration.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rentals_book_status ON rentals(book_id, status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rentals_user_id ON rentals(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rentals_due_ts ON rentals(due_ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_books_category ON books(category)")
+        conn.commit()
     finally:
         conn.close()
 
@@ -539,22 +589,25 @@ def get_rental(rental_id: int) -> Optional[dict[str, Any]]:
 
 def set_rental_status(rental_id: int, status: str, start_ts: Optional[str] = None) -> bool:
     """Update rental status only if current status is 'requested'. Returns True if updated (idempotent)."""
-    conn = _get_conn()
-    try:
-        if start_ts:
-            cur = conn.execute(
-                "UPDATE rentals SET status = ?, start_ts = ? WHERE id = ? AND status = 'requested'",
-                (status, start_ts, rental_id),
-            )
-        else:
-            cur = conn.execute(
-                "UPDATE rentals SET status = ? WHERE id = ? AND status = 'requested'",
-                (status, rental_id),
-            )
-        conn.commit()
-        return cur.rowcount > 0
-    finally:
-        conn.close()
+    def _op() -> bool:
+        conn = _get_conn()
+        try:
+            if start_ts:
+                cur = conn.execute(
+                    "UPDATE rentals SET status = ?, start_ts = ? WHERE id = ? AND status = 'requested'",
+                    (status, start_ts, rental_id),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE rentals SET status = ? WHERE id = ? AND status = 'requested'",
+                    (status, rental_id),
+                )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    return bool(_write_retry(_op))
 
 
 def list_rentals_pending_admin() -> list[dict[str, Any]]:
@@ -806,33 +859,39 @@ def update_rental_penalty(
     updates.append("penalty_updated_by = ?")
     params.append(admin_id)
     params.append(rental_id)
-    conn = _get_conn()
-    try:
-        cur = conn.execute(
-            f"UPDATE rentals SET {', '.join(updates)} WHERE id = ?",
-            params,
-        )
-        conn.commit()
-        return cur.rowcount > 0
-    finally:
-        conn.close()
+    def _op() -> bool:
+        conn = _get_conn()
+        try:
+            cur = conn.execute(
+                f"UPDATE rentals SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    return bool(_write_retry(_op))
 
 
 def close_rental_returned(rental_id: int, admin_id: int) -> bool:
     """Close rental as returned. Only if status IN ('approved','active').
     Sets status='returned', returned_at=now, closed_by_admin_id=admin_id.
     Returns True if updated, False otherwise."""
-    conn = _get_conn()
-    try:
-        cur = conn.execute(
-            "UPDATE rentals SET status = 'returned', returned_at = ?, closed_by_admin_id = ? "
-            "WHERE id = ? AND status IN ('approved', 'active')",
-            (datetime.now(timezone.utc).isoformat(), admin_id, rental_id),
-        )
-        conn.commit()
-        return cur.rowcount > 0
-    finally:
-        conn.close()
+    def _op() -> bool:
+        conn = _get_conn()
+        try:
+            cur = conn.execute(
+                "UPDATE rentals SET status = 'returned', returned_at = ?, closed_by_admin_id = ? "
+                "WHERE id = ? AND status IN ('approved', 'active')",
+                (datetime.now(timezone.utc).isoformat(), admin_id, rental_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    return bool(_write_retry(_op))
 
 
 def list_top_renters(limit: int = 10) -> list[dict[str, Any]]:

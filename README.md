@@ -5,8 +5,7 @@ Oddiy Telegram bot (Python + aiogram 3) talaba va yoshlar uchun kitoblarni ijara
 ### Tuzilishi
 
 - `main.py` – asosiy bot kodi
-- `books.json` – kitoblar ro'yxati (mahalliy saqlash, JSON)
-- `rentals.json` – ijaralar ro'yxati (mahalliy saqlash, JSON)
+- `db.py` – SQLite DB (kitoblar, ijaralar, jarima, bildirishnomalar)
 - `requirements.txt` – kerakli Python kutubxonalari
 
 ### Talablar
@@ -58,7 +57,7 @@ Oddiy Telegram bot (Python + aiogram 3) talaba va yoshlar uchun kitoblarni ijara
 6. `.env` fayli yordamida sozlash (tavsiya etiladi)
 
    - `.env` faylini loyihaning ildiziga joylashtiring yoki `.env.example` faylini nusxa ko'chirib to'ldiring.
-   - Loyihada `python-dotenv` o'rnatilgan bo'lsa, `.env` avtomatik yuklanadi va `BOT_TOKEN` hamda `ADMIN_IDS` (yoki `ADMIN_ID`) o'qiladi.
+   - Lokal development uchun `.env` avtomatik yuklanadi. Production (Render) uchun `.env` shart emas — env vars'ni dashboarddan berasiz.
 
    Misol `.env` tarkibi:
 
@@ -81,14 +80,43 @@ Bot yangi ijaralar yaratilganda avtomatik ravishda `ADMIN_IDS` dagi barcha admin
 
 ### Kitoblarni qo'shish (admin uchun)
 
-Yangi kitob qo'shish uchun `main.py` ichidagi `INITIAL_BOOKS` ro'yxatini tahrirlang va botni qayta ishga tushiring. Misol:
+Admin menyudan **\"➕ Kitob qo'shish\"** orqali bot ichidan kitob qo'shadi (UI orqali).
 
-```python
-INITIAL_BOOKS: List[Book] = [
-    Book(id=1, title="Java dasturlash asoslari", author="A. Karimov", category="Dasturlash", status="available", prices={"7":10000,"14":18000,"30":30000}),
-    Book(id=5, title="Yangi kitob nomi", author="Muallif", category="Turkum", status="available", prices={"7":5000}),
-]
-```
+---
 
-ID lar takrorlanmasligiga e'tibor bering.
+## Deploy to Render (24/7)
+
+Bu bot **polling** rejimida ishlaydi, shuning uchun Render’da **Background Worker** sifatida deploy qilish tavsiya qilinadi (Web service emas).
+
+### 1) Render sozlamalari (tavsiya etilgan)
+
+- **Service type**: Background Worker
+- **Build command**: `pip install -r requirements.txt`
+- **Start command**: `python main.py`
+
+### 2) Environment variables (majburiy)
+
+- **`BOT_TOKEN`**: `@BotFather` dan olingan token
+- **`ADMIN_IDS`**: admin Telegram ID’lari (vergul bilan), masalan: `123456789,987654321`
+
+Ixtiyoriy:
+- `REMINDERS_ENABLED=1`
+- `PENALTY_PER_DAY_DEFAULT=2000`
+
+### 3) GitHub repo ulash
+
+1. Render’da **New + → Background Worker** tanlang.
+2. GitHub repo’ni ulang.
+3. Yuqoridagi build/start commandlarni kiriting.
+4. Env vars qo‘shing (**tokenni hech qachon repo’ga commit qilmang**).
+5. Deploy qiling.
+
+### 4) SQLite haqida muhim eslatma
+
+Bot `bot.db` (SQLite) ni loyiha papkasida saqlaydi.
+
+Render fayl tizimi **ephemeral** bo‘lishi mumkin, shuning uchun production’da:
+- DB yo‘qolishi ehtimoli bor (redeploy/restart).
+
+Hozircha bu oddiy usage uchun yetarli. Keyinchalik Postgres kabi persistent DB’ga o‘tish tavsiya etiladi (hozir implement qilinmagan).
 
