@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
+from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -43,7 +44,7 @@ if _ENV_PATH.exists():
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logger.info(".env present=%s", _ENV_PATH.exists())
+logger.info(".env loaded from: %s", _ENV_PATH.resolve())
 
 BASE_DIR = _PROJECT_ROOT
 
@@ -54,6 +55,7 @@ from filters import AdminOnly
 LOCK_FILE = BASE_DIR / "bot.lock"
 REMINDERS_ENABLED = os.getenv("REMINDERS_ENABLED", "1").strip() in ("1", "true", "yes", "on")
 PAGE_SIZE = 5
+USER_BOOKS_PAGE_SIZE = 10
 
 # User sort preference: user_id -> "newest" | "author" | "category" | "manual"
 _user_sort_prefs: dict[int, str] = {}
@@ -65,6 +67,147 @@ _DEFAULT_ADMIN_FILTER = {"q": "", "category": None, "only_out_of_stock": False}
 
 # Add-book template: last category + cover (per admin)
 _add_book_last: dict[int, dict] = {}
+
+# User books list UI state (per user)
+_user_books_state: dict[int, dict] = {}
+
+
+def _get_user_books_state(user_id: int) -> dict:
+    st = _user_books_state.get(user_id)
+    if not st:
+        st = {"page": 1, "q": None}
+        _user_books_state[user_id] = st
+    return st
+
+
+def _books_list_text(page: int, total_pages: int) -> str:
+    return f"📚 Kitoblar ro'yxati (sahifa {page}/{total_pages}). Birini tanlang:"
+
+
+def _books_list_keyboard(books: list, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows = []
+    for b in books:
+        title = (b.get("title") or "Noma'lum")[:60]
+        rows.append([InlineKeyboardButton(text=title, callback_data=f"book_{b['id']}")])
+
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"books_page_{page-1}"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"books_page_{page+1}"))
+    if nav:
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton(text="🔎 Qidiruv", callback_data="books_search")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _send_books_list(message: Message, *, page: int = 1, q: Optional[str] = None) -> None:
+    """Send books list (title-only buttons) for user."""
+    uid = message.from_user.id if message.from_user else 0
+    st = _get_user_books_state(uid)
+    st["page"] = max(1, int(page))
+    st["q"] = q
+
+    offset = (st["page"] - 1) * USER_BOOKS_PAGE_SIZE
+    books = db.list_books(offset=offset, limit=USER_BOOKS_PAGE_SIZE, q=q, sort_mode=db.SORT_TITLE)
+    total = db.count_books(q=q)
+    total_pages = max(1, (total + USER_BOOKS_PAGE_SIZE - 1) // USER_BOOKS_PAGE_SIZE)
+    if st["page"] > total_pages:
+        st["page"] = total_pages
+        offset = (st["page"] - 1) * USER_BOOKS_PAGE_SIZE
+        books = db.list_books(offset=offset, limit=USER_BOOKS_PAGE_SIZE, q=q, sort_mode=db.SORT_TITLE)
+
+    text = _books_list_text(st["page"], total_pages)
+    await message.answer(text, reply_markup=_books_list_keyboard(books, st["page"], total_pages))
+
+
+async def _edit_books_list(callback: CallbackQuery, *, page: int = 1) -> None:
+    """Edit current message with books list, using stored query."""
+    uid = callback.from_user.id if callback.from_user else 0
+    st = _get_user_books_state(uid)
+    st["page"] = max(1, int(page))
+    q = st.get("q")
+
+    offset = (st["page"] - 1) * USER_BOOKS_PAGE_SIZE
+    books = db.list_books(offset=offset, limit=USER_BOOKS_PAGE_SIZE, q=q, sort_mode=db.SORT_TITLE)
+    total = db.count_books(q=q)
+    total_pages = max(1, (total + USER_BOOKS_PAGE_SIZE - 1) // USER_BOOKS_PAGE_SIZE)
+    if st["page"] > total_pages:
+        st["page"] = total_pages
+        offset = (st["page"] - 1) * USER_BOOKS_PAGE_SIZE
+        books = db.list_books(offset=offset, limit=USER_BOOKS_PAGE_SIZE, q=q, sort_mode=db.SORT_TITLE)
+
+    text = _books_list_text(st["page"], total_pages)
+    await callback.message.edit_text(text, reply_markup=_books_list_keyboard(books, st["page"], total_pages))
+
+
+async def cb_books_page_simple(callback: CallbackQuery):
+    data = callback.data or ""
+    if not data.startswith("books_page_"):
+        await callback.answer()
+        return
+    try:
+        page = int(data.replace("books_page_", ""))
+    except ValueError:
+        page = 1
+    await _edit_books_list(callback, page=page)
+    await callback.answer()
+
+
+async def cb_book_detail(callback: CallbackQuery):
+    """User book detail for book_{id}: show info + rent/back."""
+    data = callback.data or ""
+    if not data.startswith("book_"):
+        await callback.answer()
+        return
+    try:
+        book_id = int(data.replace("book_", ""))
+    except ValueError:
+        await callback.answer("Xatolik.")
+        return
+    book = db.get_book(book_id)
+    if not book:
+        await callback.answer("Kitob topilmadi.", show_alert=True)
+        return
+    stock = db.get_book_stock(book_id) or {}
+    available = stock.get("available", 0)
+    total = stock.get("total", 0)
+    title = html.escape(book.get("title") or "?")
+    author = html.escape(book.get("author") or "—")
+    category = html.escape(book.get("category") or "—")
+    year = book.get("year") or 0
+    year_line = f"\nYil: {year}" if year else ""
+    cover = (book.get("cover_type") or "").strip()
+    cover_line = f"\nMuqova: {html.escape(cover)}" if cover else ""
+    fee = book.get("rent_fee", 0)
+    text = (
+        f"📘 <b>{title}</b>\n"
+        f"Muallif: {author}\n"
+        f"Kategoriya: {category}"
+        f"{year_line}"
+        f"{cover_line}\n"
+        f"📦 Mavjud: {available} / {total}\n"
+        f"💰 Ijara: {fee:,} so'm/kun\n"
+        f"💵 Depozit: 0 so'm"
+    )
+    rows = []
+    if available > 0:
+        rows.append([InlineKeyboardButton(text="📌 Ijaraga olish", callback_data=f"rent_{book_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="books_list_back")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    if book.get("photo_id"):
+        await callback.message.answer_photo(book["photo_id"], caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    else:
+        await callback.message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
+async def cb_books_list_back(callback: CallbackQuery):
+    uid = callback.from_user.id if callback.from_user else 0
+    st = _get_user_books_state(uid)
+    await _edit_books_list(callback, page=st.get("page", 1))
+    await callback.answer()
 
 
 def _get_admin_filter(admin_id: int) -> dict:
@@ -148,7 +291,6 @@ class AddBookStates(StatesGroup):
     cover_type = State()
     qty = State()
     rent_fee = State()
-    deposit = State()
     photo = State()
     preview = State()
 
@@ -185,6 +327,17 @@ class AdminBroadcastStates(StatesGroup):
     confirm = State()
 
 
+class UserPickupStates(StatesGroup):
+    day = State()
+    slot = State()
+
+
+class AdminSettingsStates(StatesGroup):
+    address = State()
+    contact = State()
+    work_hours = State()
+
+
 # Cheklov: batch size va delay (Telegram rate limit)
 BROADCAST_BATCH_SIZE = 25
 BROADCAST_DELAY_SEC = 1.0
@@ -210,18 +363,21 @@ def admin_menu_keyboard() -> ReplyKeyboardMarkup:
         KeyboardButton(text="📚 Kitoblarim"),
     )
     builder.row(
-        KeyboardButton(text="🧹 Tozalash"),
         KeyboardButton(text="📦 Ijaralar"),
+        KeyboardButton(text="⏰ Kechikkanlar"),
     )
     builder.row(
-        KeyboardButton(text="⏰ Kechikkanlar"),
         KeyboardButton(text="💰 Jarima"),
+        KeyboardButton(text="📤 Export"),
     )
     builder.row(
         KeyboardButton(text="📊 Userlar statistikasi"),
         KeyboardButton(text="📢 E'lon"),
     )
-    builder.row(KeyboardButton(text="📤 Export"))
+    builder.row(
+        KeyboardButton(text="⚙️ Sozlamalar"),
+        KeyboardButton(text="💰 Daromad"),
+    )
     return builder.as_markup(resize_keyboard=True)
 
 
@@ -230,7 +386,6 @@ def admin_menu_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Kitob qo'shish", callback_data="admin_add_book")],
         [InlineKeyboardButton(text="📚 Kitoblarim", callback_data="admin_books")],
-        [InlineKeyboardButton(text="🧹 Tozalash", callback_data="admin_wipe")],
         [InlineKeyboardButton(text="📦 Ijaralar", callback_data="admin_rentals")],
     ])
 
@@ -292,7 +447,7 @@ def admin_books_keyboard(books: list, page: int, total_pages: int, filter_state:
             InlineKeyboardButton(text="🔎 Qidiruv", callback_data="admin_books_filter_search"),
             InlineKeyboardButton(text="🏷 Kategoriya", callback_data="admin_books_filter_cat"),
             InlineKeyboardButton(text=out_text, callback_data="admin_books_filter_oos"),
-            InlineKeyboardButton(text="♻️ Tozalash", callback_data="admin_books_filter_clear"),
+            InlineKeyboardButton(text="♻️ Filtrni tozalash", callback_data="admin_books_filter_clear"),
         ])
     for b in books:
         title = (b.get("title", "") or "Noma'lum")[:30]
@@ -300,8 +455,8 @@ def admin_books_keyboard(books: list, page: int, total_pages: int, filter_state:
             InlineKeyboardButton(text=f"📘 {title}", callback_data=f"admin_book_{b['id']}"),
         ])
         rows.append([
-            InlineKeyboardButton(text="✏️ Edit", callback_data=f"admin_edit_{b['id']}"),
-            InlineKeyboardButton(text="🗑 Delete", callback_data=f"admin_del_{b['id']}"),
+            InlineKeyboardButton(text="✏️ Tahrirlash", callback_data=f"admin_edit_{b['id']}"),
+            InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"admin_del_{b['id']}"),
         ])
     nav = []
     if page > 1:
@@ -317,7 +472,7 @@ def admin_books_keyboard(books: list, page: int, total_pages: int, filter_state:
 def admin_del_confirm_keyboard(book_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Ha, o'chirish", callback_data=f"admin_del_confirm_{book_id}")],
-        [InlineKeyboardButton(text="❌ Bekor", callback_data="admin_books")],
+        [InlineKeyboardButton(text="❌ Bekor", callback_data=f"admin_del_cancel_{book_id}")],
     ])
 
 
@@ -386,7 +541,7 @@ def admin_rentals_keyboard(rentals: list) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"rental_ok_{r['id']}"),
                 InlineKeyboardButton(text="❌ Rad etish", callback_data=f"rental_no_{r['id']}"),
             ])
-        elif status in ("approved", "active"):
+        elif status == "active":
             rows.append([
                 InlineKeyboardButton(text="✅ Qaytarildi", callback_data=f"rental_return_{r['id']}"),
             ])
@@ -463,7 +618,7 @@ async def cb_rental_detail(callback: CallbackQuery):
             InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"rental_ok_{rental_id}"),
             InlineKeyboardButton(text="❌ Rad etish", callback_data=f"rental_no_{rental_id}"),
         ])
-    elif st in ("approved", "active"):
+    elif st == "active":
         rows.append([InlineKeyboardButton(text="✅ Qaytarildi", callback_data=f"rental_return_{rental_id}")])
     rows.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin_rentals")])
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode=ParseMode.HTML)
@@ -477,6 +632,36 @@ def rental_period_keyboard(book_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="14 kun", callback_data=f"period_{book_id}_14"),
         ],
         [InlineKeyboardButton(text="30 kun", callback_data=f"period_{book_id}_30")],
+    ])
+
+
+def rental_payment_keyboard(book_id: int, days: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="💵 Naqd", callback_data=f"paym_{book_id}_{days}_cash"),
+            InlineKeyboardButton(text="🟦 Click", callback_data=f"paym_{book_id}_{days}_click"),
+        ],
+        [InlineKeyboardButton(text="🟩 Payme", callback_data=f"paym_{book_id}_{days}_payme")],
+        [InlineKeyboardButton(text="❌ Bekor", callback_data="noop")],
+    ])
+
+
+def pickup_day_keyboard(rental_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Bugun", callback_data=f"pickup_day_{rental_id}_0")],
+        [InlineKeyboardButton(text="Ertaga", callback_data=f"pickup_day_{rental_id}_1")],
+        [InlineKeyboardButton(text="Indinga", callback_data=f"pickup_day_{rental_id}_2")],
+        [InlineKeyboardButton(text="❌ Bekor", callback_data=f"pickup_cancel_{rental_id}")],
+    ])
+
+
+def pickup_slot_keyboard(rental_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="10:00–12:00", callback_data=f"pickup_slot_{rental_id}_10-12")],
+        [InlineKeyboardButton(text="12:00–14:00", callback_data=f"pickup_slot_{rental_id}_12-14")],
+        [InlineKeyboardButton(text="14:00–16:00", callback_data=f"pickup_slot_{rental_id}_14-16")],
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"pickup_back_{rental_id}")],
+        [InlineKeyboardButton(text="❌ Bekor", callback_data=f"pickup_cancel_{rental_id}")],
     ])
 
 
@@ -506,19 +691,9 @@ async def show_rules(message: Message):
 
 
 async def show_books_menu(message: Message):
-    """Show categories and search for books."""
+    """Entry point for user catalog: show books list immediately (no categories)."""
     try:
-        cats = db.get_categories()
-        if not cats:
-            await message.answer("Hozircha kitoblar mavjud emas.", reply_markup=main_menu_keyboard())
-            return
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=c, callback_data=f"cat_{c}")] for c in cats
-        ] + [
-            [InlineKeyboardButton(text="📚 Barcha kitoblar", callback_data="cat_all")],
-            [InlineKeyboardButton(text="🔎 Qidiruv", callback_data="books_search")],
-        ])
-        await message.answer("📚 Kitoblar yoki kategoriyani tanlang:", reply_markup=kb)
+        await _send_books_list(message, page=1, q=None)
     except Exception:
         logger.exception("show_books_menu failed")
         await message.answer("Xatolik chiqdi, /start ni qayta bosing.", reply_markup=main_menu_keyboard())
@@ -677,29 +852,17 @@ async def search_query_handler(message: Message, state: FSMContext):
         await message.answer("Iltimos, qidiruv so'zini kiriting.")
         return
     await state.clear()
-    sort_mode = _get_sort_mode(message.from_user.id)
-    books = db.list_books(offset=0, limit=PAGE_SIZE, q=q, sort_mode=sort_mode)
-    total = db.count_books(q=q)
-    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
-    if not books:
-        await message.answer("Hech narsa topilmadi.", reply_markup=main_menu_keyboard())
-        return
-    text = f"🔎 <b>Qidiruv natijalari</b> — Sahifa 1/{total_pages}\n\n"
-    for b in books:
-        stock = db.get_book_stock(b["id"]) or {}
-        av, tot = stock.get("available", 0), stock.get("total", 0)
-        text += f"• {html.escape(b['title'])} — {html.escape(b['author'])}\n"
-        text += f"  💰 {b.get('rent_fee', 0)} so'm/kun | 📦 Mavjud: {av} / {tot}\n\n"
-    await message.answer(text, reply_markup=books_list_keyboard(books, 1, total_pages, q=q, sort_mode=sort_mode), parse_mode=ParseMode.HTML)
+    # Show the same title-only list UI with query applied
+    await _send_books_list(message, page=1, q=q)
 
 
 async def cb_rent_book(callback: CallbackQuery):
     data = callback.data or ""
-    if not (data.startswith("rent_") or data.startswith("book_")):
+    if not data.startswith("rent_"):
         await callback.answer()
         return
     try:
-        book_id = int(data.replace("rent_", "").replace("book_", ""))
+        book_id = int(data.replace("rent_", ""))
     except ValueError:
         await callback.answer("Xatolik.")
         return
@@ -752,13 +915,61 @@ async def cb_rental_period(callback: CallbackQuery, state: FSMContext):
     if stock.get("available", 0) <= 0:
         await callback.answer("❌ Kechirasiz, bu kitob hozir mavjud emas.", show_alert=True)
         return
+    await state.clear()
+    await callback.message.answer(
+        "💰 To'lov turini tanlang:",
+        reply_markup=rental_payment_keyboard(book_id, days),
+    )
+    await callback.answer()
+
+
+async def cb_rental_payment_method(callback: CallbackQuery):
+    data = callback.data or ""
+    if not data.startswith("paym_"):
+        await callback.answer()
+        return
+    try:
+        parts = data.split("_")
+        if len(parts) != 4:
+            raise ValueError("bad format")
+        _, book_id_str, days_str, method = parts
+        book_id = int(book_id_str)
+        days = int(days_str)
+        method = (method or "").strip().lower()
+        if method not in ("cash", "click", "payme"):
+            raise ValueError("bad method")
+    except Exception:
+        await callback.answer("Xatolik.")
+        return
+
+    book = db.get_book(book_id)
+    if not book:
+        await callback.answer("Kitob topilmadi.", show_alert=True)
+        return
+    stock = db.get_book_stock(book_id) or {}
+    if stock.get("available", 0) <= 0:
+        await callback.answer("❌ Kechirasiz, bu kitob hozir mavjud emas.", show_alert=True)
+        return
+
     due = (datetime.now().date() + timedelta(days=days)).strftime("%Y-%m-%d")
-    rental_id = db.create_rental_request(callback.from_user.id, book_id, due)
+    fee_per_day = int(book.get("rent_fee") or 0)
+    total_fee = max(0, fee_per_day * max(0, days))
+    rental_id = db.create_rental_request(
+        callback.from_user.id if callback.from_user else 0,
+        book_id,
+        due,
+        period_days=days,
+        rent_fee_total=total_fee,
+        payment_method=method,
+    )
+
+    pm_txt = {"cash": "💵 Naqd", "click": "🟦 Click", "payme": "🟩 Payme"}.get(method, method)
     admin_text = (
         "📚 <b>Yangi ijara so'rovi</b>\n\n"
         f"👤 Foydalanuvchi: {callback.from_user.id} (@{callback.from_user.username or '—'})\n"
         f"📖 Kitob: {book['title']} ({book['author']})\n"
         f"📅 Qaytarish: {due}\n"
+        f"💰 To'lov: {pm_txt}\n"
         f"🆔 ID: {rental_id}"
     )
     for admin_id in ADMIN_IDS:
@@ -769,13 +980,14 @@ async def cb_rental_period(callback: CallbackQuery, state: FSMContext):
                     InlineKeyboardButton(text="❌ Rad etish", callback_data=f"rental_no_{rental_id}"),
                 ],
             ])
-            await callback.bot.send_message(admin_id, admin_text, reply_markup=kb)
+            await callback.bot.send_message(admin_id, admin_text, reply_markup=kb, parse_mode=ParseMode.HTML)
         except Exception as e:
             logger.warning("Admin notify failed: %s", e)
-    await callback.message.answer(
-        "✅ So'rovingiz yuborildi. Admin tasdiqlagach xabar olasiz.",
-        reply_markup=main_menu_keyboard(),
-    )
+
+    try:
+        await callback.message.edit_text("✅ So'rovingiz yuborildi. Admin tasdiqlagach xabar olasiz.")
+    except Exception:
+        await callback.message.answer("✅ So'rovingiz yuborildi. Admin tasdiqlagach xabar olasiz.")
     await callback.answer()
 
 
@@ -832,15 +1044,6 @@ async def admin_books_msg(message: Message):
     await message.answer(text, reply_markup=admin_books_keyboard(books, 1, total_pages, filter_state=f), parse_mode=ParseMode.HTML)
 
 
-async def admin_wipe_msg(message: Message):
-    """Handle '🧹 Tozalash' text button."""
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Ha, hammasini o'chir", callback_data="wipe_confirm")],
-        [InlineKeyboardButton(text="❌ Bekor", callback_data="wipe_cancel")],
-    ])
-    await message.answer("⚠️ Barcha kitoblar va ijaralar o'chiriladi. Tasdiqlaysizmi?", reply_markup=kb)
-
-
 def _format_admin_books_filter_header(f: dict) -> str:
     """Build filter header line for admin books list."""
     parts = []
@@ -882,7 +1085,20 @@ def _admin_rentals_text(rentals: list) -> str:
         for r in rentals:
             st = r.get("status", "?")
             st_uz = {"requested": "⏳ So'rov", "approved": "✅ Tasdiqlangan", "active": "📖 Faol"}.get(st, st)
-            text += f"• {r.get('book_title')} — User {r['user_id']} — {r.get('due_ts')} ({st_uz})\n"
+            pm = (r.get("payment_method") or "").strip().lower()
+            pm_txt = "—"
+            if pm == "cash":
+                pm_txt = "💵 Naqd"
+            elif pm == "click":
+                pm_txt = "🟦 Click"
+            elif pm == "payme":
+                pm_txt = "🟩 Payme"
+            ps = (r.get("payment_status") or "pending").strip().lower()
+            ps_txt = "pending" if ps not in ("pending", "paid") else ps
+            text += (
+                f"• {r.get('book_title')} — User {r['user_id']} — {r.get('due_ts')} ({st_uz})\n"
+                f"  {pm_txt} | To'lov: {ps_txt}\n"
+            )
     return text
 
 
@@ -999,6 +1215,103 @@ async def admin_export_msg(message: Message):
         [InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin_back")],
     ])
     await message.answer("📤 <b>Export (zaxira)</b>\n\nKitoblar va ijaralar. Formatni tanlang:", reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+def _settings_text() -> str:
+    s = db.get_shop_settings()
+    addr = html.escape(s.get("address") or "—")
+    contact = html.escape(s.get("contact") or "—")
+    wh = html.escape(s.get("work_hours") or "—")
+    click_link = html.escape(s.get("click_link") or "—")
+    payme_link = html.escape(s.get("payme_link") or "—")
+    return (
+        "⚙️ <b>Sozlamalar</b>\n\n"
+        f"📍 Manzil: {addr}\n"
+        f"📞 Aloqa: {contact}\n"
+        f"🕒 Ish vaqti: {wh}\n"
+        f"🟦 Click: {click_link}\n"
+        f"🟩 Payme: {payme_link}\n"
+    )
+
+
+def admin_settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📍 Manzil", callback_data="settings_edit_address")],
+        [InlineKeyboardButton(text="📞 Aloqa", callback_data="settings_edit_contact")],
+        [InlineKeyboardButton(text="🕒 Ish vaqti", callback_data="settings_edit_work_hours")],
+        [InlineKeyboardButton(text="🟦 Click link", callback_data="settings_edit_click_link")],
+        [InlineKeyboardButton(text="🟩 Payme link", callback_data="settings_edit_payme_link")],
+        [InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin_back")],
+    ])
+
+
+async def admin_settings_msg(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(_settings_text(), reply_markup=admin_settings_keyboard(), parse_mode=ParseMode.HTML)
+
+
+async def admin_income_msg(message: Message):
+    today = datetime.now(timezone.utc).date()
+    today_s = today.isoformat()
+    week_start = (today - timedelta(days=6)).isoformat()
+    month_start = today.replace(day=1).isoformat()
+
+    t = db.revenue_summary(today_s, today_s)
+    w = db.revenue_summary(week_start, today_s)
+    m = db.revenue_summary(month_start, today_s)
+    overdue = db.count_overdue_rentals(today_s)
+
+    text = (
+        "💰 <b>Daromad</b>\n\n"
+        f"📅 Bugun ({today_s}): {t['rental_count']} ta | Jami: {t['rent_fee_sum']:,} so'm\n"
+        f"🗓 So'nggi 7 kun: {w['rental_count']} ta | Jami: {w['rent_fee_sum']:,} so'm\n"
+        f"🗓 Shu oy: {m['rental_count']} ta | Jami: {m['rent_fee_sum']:,} so'm\n\n"
+        f"⏰ Kechikkanlar (hozir): {overdue} ta"
+    )
+    await message.answer(text, reply_markup=admin_menu_keyboard(), parse_mode=ParseMode.HTML)
+
+
+async def cb_settings_edit(callback: CallbackQuery, state: FSMContext):
+    data = callback.data or ""
+    mapping = {
+        "settings_edit_address": ("address", AdminSettingsStates.address, "📍 Manzilni kiriting:"),
+        "settings_edit_contact": ("contact", AdminSettingsStates.contact, "📞 Aloqa ma'lumotini kiriting:"),
+        "settings_edit_work_hours": ("work_hours", AdminSettingsStates.work_hours, "🕒 Ish vaqtini kiriting:"),
+        "settings_edit_click_link": ("click_link", AdminSettingsStates.contact, "🟦 Click linkni kiriting (yoki -):"),
+        "settings_edit_payme_link": ("payme_link", AdminSettingsStates.contact, "🟩 Payme linkni kiriting (yoki -):"),
+    }
+    if data not in mapping:
+        await callback.answer()
+        return
+    key, st, prompt = mapping[data]
+    await state.set_state(st)
+    await state.update_data(settings_key=key)
+    await callback.message.answer(prompt)
+    await callback.answer()
+
+
+async def admin_settings_save(message: Message, state: FSMContext):
+    st = await state.get_state()
+    txt = (message.text or "").strip()
+    if txt == "-":
+        txt = ""
+    data = await state.get_data()
+    key = data.get("settings_key")
+    if not key:
+        key_map = {
+            AdminSettingsStates.address.state: "address",
+            AdminSettingsStates.contact.state: "contact",
+            AdminSettingsStates.work_hours.state: "work_hours",
+        }
+        key = key_map.get(st or "")
+    if not key:
+        await state.clear()
+        await message.answer("Sessiya tugadi. /admin bosing.")
+        return
+    db.set_setting(key, txt)
+    await state.clear()
+    await message.answer("✅ Saqlandi.")
+    await message.answer(_settings_text(), reply_markup=admin_settings_keyboard(), parse_mode=ParseMode.HTML)
 
 
 def _export_to_json() -> bytes:
@@ -1536,16 +1849,6 @@ async def cmd_admin_rentals_msg(message: Message):
     ])
     await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
-
-async def cmd_wipe_all(message: Message):
-    """Admin: wipe all books and rentals. Asks confirmation."""
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Ha, hammasini o'chir", callback_data="wipe_confirm")],
-        [InlineKeyboardButton(text="❌ Bekor", callback_data="wipe_cancel")],
-    ])
-    await message.answer("⚠️ Barcha kitoblar va ijaralar o'chiriladi. Tasdiqlaysizmi?", reply_markup=kb)
-
-
 async def cmd_set_order(message: Message):
     """Admin: /set_order <book_id> <number> — set sort_order for manual ordering."""
     parts = (message.text or "").strip().split()
@@ -1562,31 +1865,6 @@ async def cmd_set_order(message: Message):
         await message.answer(f"✅ Kitob ID {book_id} uchun sort_order = {sort_order} o'rnatildi.")
     else:
         await message.answer("Kitob topilmadi.")
-
-
-async def cb_admin_wipe(callback: CallbackQuery):
-    """Handle 'admin_wipe' from inline menu."""
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Ha, hammasini o'chir", callback_data="wipe_confirm")],
-        [InlineKeyboardButton(text="❌ Bekor", callback_data="wipe_cancel")],
-    ])
-    try:
-        await callback.message.edit_text("⚠️ Barcha kitoblar va ijaralar o'chiriladi. Tasdiqlaysizmi?", reply_markup=kb)
-    except Exception:
-        await callback.message.answer("⚠️ Barcha kitoblar va ijaralar o'chiriladi. Tasdiqlaysizmi?", reply_markup=kb)
-    await callback.answer()
-
-
-async def cb_wipe_confirm(callback: CallbackQuery):
-    db.wipe_all()
-    await callback.message.edit_text("🧹 Barcha kitoblar va ijaralar tozalandi.")
-    await callback.answer()
-
-
-async def cb_wipe_cancel(callback: CallbackQuery):
-    await callback.message.edit_text("Bekor qilindi.")
-    await callback.answer()
-
 
 async def cb_admin_add_book(callback: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -1730,11 +2008,15 @@ async def add_book_rent_fee(message: Message, state: FSMContext):
         await message.answer("Iltimos, 0 dan katta butun son kiriting (masalan: 5000).")
         return
     await state.update_data(rent_fee=fee)
-    await state.set_state(AddBookStates.deposit)
+    await state.update_data(deposit=0)
+    await state.set_state(AddBookStates.photo)
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏭ O'tkazib yuborish (0)", callback_data="add_deposit_skip")],
+        [InlineKeyboardButton(text="⏭ O'tkazib yuborish", callback_data="add_book_photo_skip")],
     ])
-    await message.answer("Depozit (so'm, ixtiyoriy):", reply_markup=kb)
+    await message.answer(
+        "📸 Iltimos, kitob rasmini yuboring (yoki 'O'tkazib yuborish' tugmasini bosing)",
+        reply_markup=kb,
+    )
 
 
 async def add_book_rent_fee_quick(callback: CallbackQuery, state: FSMContext):
@@ -1752,45 +2034,17 @@ async def add_book_rent_fee_quick(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Xatolik.")
         return
     await state.update_data(rent_fee=fee)
-    await state.set_state(AddBookStates.deposit)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏭ O'tkazib yuborish (0)", callback_data="add_deposit_skip")],
-    ])
-    await callback.message.edit_text(f"Ijara narxi: {fee:,} so'm/kun ✓")
-    await callback.message.answer("Depozit (so'm, ixtiyoriy):", reply_markup=kb)
-    await callback.answer()
-
-
-async def add_book_deposit_skip(callback: CallbackQuery, state: FSMContext):
     await state.update_data(deposit=0)
     await state.set_state(AddBookStates.photo)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⏭ O'tkazib yuborish", callback_data="add_book_photo_skip")],
     ])
+    await callback.message.edit_text(f"Ijara narxi: {fee:,} so'm/kun ✓")
     await callback.message.answer(
         "📸 Iltimos, kitob rasmini yuboring (yoki 'O'tkazib yuborish' tugmasini bosing)",
         reply_markup=kb,
     )
     await callback.answer()
-
-
-async def add_book_deposit(message: Message, state: FSMContext):
-    try:
-        dep = int((message.text or "").strip()) if (message.text or "").strip() else 0
-        if dep < 0:
-            raise ValueError("Manfiy bo'lmasligi kerak")
-    except ValueError:
-        await message.answer("Butun son kiriting (0 yoki bo'sh qoldirish mumkin).")
-        return
-    await state.update_data(deposit=dep)
-    await state.set_state(AddBookStates.photo)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏭ O'tkazib yuborish", callback_data="add_book_photo_skip")],
-    ])
-    await message.answer(
-        "📸 Iltimos, kitob rasmini yuboring (yoki 'O'tkazib yuborish' tugmasini bosing)",
-        reply_markup=kb,
-    )
 
 
 def _add_book_preview_text(data: dict) -> str:
@@ -1804,7 +2058,6 @@ def _add_book_preview_text(data: dict) -> str:
         f"Rasm: {photo_t}\n"
         f"Soni: {data.get('qty', 1)}\n"
         f"Ijara narxi: {data.get('rent_fee')} so'm/kun\n"
-        f"Depozit: {data.get('deposit', 0)} so'm\n\n"
         "Saqlash mumkinmi?"
     )
 
@@ -1855,7 +2108,7 @@ async def add_book_save(callback: CallbackQuery, state: FSMContext):
         author=data["author"],
         category=data["category"],
         rent_fee=data["rent_fee"],
-        deposit=data.get("deposit", 0),
+        deposit=0,
         qty=data.get("qty", 1),
         year=data.get("year", 0),
         publisher="",
@@ -1907,6 +2160,48 @@ async def cb_admin_books_page(callback: CallbackQuery):
     if not books:
         text = f"📚 <b>Kitoblarim</b> — 0/{total_pages}\n{_format_admin_books_filter_header(f)}\n\nKitoblar yo'q."
     await callback.message.edit_text(text, reply_markup=admin_books_keyboard(books, page, total_pages, filter_state=f), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
+def _admin_book_detail_text_kb(book: dict) -> tuple[str, InlineKeyboardMarkup]:
+    book_id = int(book.get("id") or 0)
+    stock = db.get_book_stock(book_id) or {}
+    st = f"📦 Jami: {stock.get('total', 0)} | 🔒 Band: {stock.get('rented', 0)} | "
+    st += f"✅ Mavjud: {stock.get('available', 0)}" if stock.get("available", 0) > 0 else "❌ Mavjud emas"
+    text = (
+        f"📘 <b>{html.escape(book.get('title', '?'))}</b>\n"
+        f"ID: <code>{book_id}</code>\n"
+        f"Muallif: {html.escape(book.get('author', '—'))}\n"
+        f"Kategoriya: {html.escape(book.get('category', '—'))}\n"
+        f"{st}\n"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✏️ Tahrirlash", callback_data=f"admin_edit_{book_id}"),
+            InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"admin_del_{book_id}"),
+        ],
+        [InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin_books")],
+    ])
+    return text, kb
+
+
+async def cb_admin_book_detail(callback: CallbackQuery):
+    """Admin: show a single book card (admin_book_{id})."""
+    data = callback.data or ""
+    if not data.startswith("admin_book_"):
+        await callback.answer()
+        return
+    try:
+        book_id = int(data.replace("admin_book_", ""))
+    except ValueError:
+        await callback.answer("Xatolik.")
+        return
+    book = db.get_book(book_id)
+    if not book:
+        await callback.answer("Kitob topilmadi.", show_alert=True)
+        return
+    text, kb = _admin_book_detail_text_kb(book)
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
     await callback.answer()
 
 
@@ -2007,11 +2302,42 @@ async def cb_admin_del_book(callback: CallbackQuery):
         return
     title = (book.get("title") or "?")[:50]
     await callback.message.edit_text(
-        f"🗑 <b>{html.escape(title)}</b> — o'chirishni tasdiqlaysizmi?",
+        f"⚠️ Shu kitobni o'chirasizmi?\n"
+        f"Nomi: <b>{html.escape(title)}</b>\n"
+        f"ID: <code>{book_id}</code>",
         reply_markup=admin_del_confirm_keyboard(book_id),
         parse_mode=ParseMode.HTML,
     )
     await callback.answer()
+
+
+async def cb_admin_del_cancel(callback: CallbackQuery):
+    """Cancel delete and return back to book detail (or list)."""
+    data = callback.data or ""
+    if not data.startswith("admin_del_cancel_"):
+        await callback.answer()
+        return
+    try:
+        book_id = int(data.replace("admin_del_cancel_", ""))
+    except ValueError:
+        await callback.answer("Xatolik.")
+        return
+    book = db.get_book(book_id)
+    if not book:
+        admin_id = callback.from_user.id if callback.from_user else 0
+        text, books, total_pages, f = _build_admin_books_list(admin_id, page=1)
+        if not books:
+            text = f"📚 <b>Kitoblarim</b> — 0/1\n{_format_admin_books_filter_header(f)}\n\nKitoblar yo'q."
+        await callback.message.edit_text(
+            text,
+            reply_markup=admin_books_keyboard(books, 1, total_pages, filter_state=f),
+            parse_mode=ParseMode.HTML,
+        )
+        await callback.answer("Bekor qilindi.")
+        return
+    text, kb = _admin_book_detail_text_kb(book)
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await callback.answer("Bekor qilindi.")
 
 
 async def cb_admin_del_confirm(callback: CallbackQuery):
@@ -2026,14 +2352,19 @@ async def cb_admin_del_confirm(callback: CallbackQuery):
         await callback.answer("Xatolik.")
         return
     if db.has_active_rentals(book_id):
-        await callback.answer("❌ Bu kitob hozir ijarada, o'chirib bo'lmaydi.", show_alert=True)
+        await callback.answer(
+            "❌ O‘chirish mumkin emas: bu kitob hozir ijarada (faol ijaralar bor). Avval qaytarib yoping.",
+            show_alert=True,
+        )
         return
     if db.delete_book(book_id):
-        await callback.answer("Kitob o'chirildi.", show_alert=True)
+        await callback.answer("✅ Kitob o‘chirildi.", show_alert=True)
         admin_id = callback.from_user.id if callback.from_user else 0
         text, books, total_pages, f = _build_admin_books_list(admin_id, page=1)
         if not books:
             text = f"📚 <b>Kitoblarim</b> — 0/1\n{_format_admin_books_filter_header(f)}\n\nKitoblar yo'q."
+        else:
+            text = "✅ Kitob o‘chirildi.\n\n" + text
         try:
             await callback.message.edit_text(text, reply_markup=admin_books_keyboard(books, 1, total_pages, filter_state=f), parse_mode=ParseMode.HTML)
         except Exception:
@@ -2262,12 +2593,31 @@ async def cb_rental_ok(callback: CallbackQuery):
     # Re-fetch for freshest status/fields
     rental = db.get_rental(rental_id) or rental
     try:
+        s = db.get_shop_settings()
+        addr = s.get("address") or "—"
+        contact = s.get("contact") or "—"
+        wh = s.get("work_hours") or "—"
+        pm = (rental.get("payment_method") or "").strip().lower()
+        pay_lines = ""
+        if pm == "click":
+            link = (s.get("click_link") or "").strip()
+            if link:
+                pay_lines = f"\n\n🟦 Click: {link}"
+        elif pm == "payme":
+            link = (s.get("payme_link") or "").strip()
+            if link:
+                pay_lines = f"\n\n🟩 Payme: {link}"
         await callback.bot.send_message(
             rental["user_id"],
-            f"✅ Ijara tasdiqlandi!\n\n"
-            f"📖 Kitob: {rental.get('book_title')}\n"
-            f"📅 Qaytarish sanasi: {rental.get('due_ts')}\n\n"
-            "Kitobni belgilangan muddatda qaytarishni unutmang.",
+            (
+                "✅ Ijara tasdiqlandi!\n\n"
+                f"📖 Kitob: {rental.get('book_title')}\n"
+                f"📅 Qaytarish sanasi: {rental.get('due_ts')}\n\n"
+                f"📞 Kontakt: {contact}\n"
+                f"📍 Manzil: {addr}\n"
+                f"🕒 Ish vaqti: {wh}"
+                f"{pay_lines}"
+            ),
         )
     except Exception as e:
         logger.warning("User notify failed: %s", e)
@@ -2372,6 +2722,106 @@ async def cb_books_back(callback: CallbackQuery):
 async def cb_noop(callback: CallbackQuery):
     await callback.answer()
 
+
+async def cb_pickup_day(callback: CallbackQuery):
+    data = callback.data or ""
+    if not data.startswith("pickup_day_"):
+        await callback.answer()
+        return
+    try:
+        _, _, rid_str, off_str = data.split("_", 3)
+        rental_id = int(rid_str)
+        offset = int(off_str)
+    except Exception:
+        await callback.answer("Xatolik.")
+        return
+    rental = db.get_rental(rental_id)
+    uid = callback.from_user.id if callback.from_user else 0
+    if not rental or int(rental.get("user_id") or 0) != int(uid):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    base = datetime.now().date()
+    pickup_date = (base + timedelta(days=max(0, min(2, offset)))).strftime("%Y-%m-%d")
+    db.update_rental_schedule(rental_id, pickup_date=pickup_date)
+    await callback.message.edit_text(
+        f"🕒 Olib ketish vaqtini tanlang:\n📅 Sana: {pickup_date}",
+        reply_markup=pickup_slot_keyboard(rental_id),
+    )
+    await callback.answer()
+
+
+async def cb_pickup_back(callback: CallbackQuery):
+    data = callback.data or ""
+    if not data.startswith("pickup_back_"):
+        await callback.answer()
+        return
+    try:
+        rental_id = int(data.replace("pickup_back_", ""))
+    except ValueError:
+        await callback.answer("Xatolik.")
+        return
+    rental = db.get_rental(rental_id)
+    uid = callback.from_user.id if callback.from_user else 0
+    if not rental or int(rental.get("user_id") or 0) != int(uid):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    await callback.message.edit_text("📅 Olib ketish kunini tanlang:", reply_markup=pickup_day_keyboard(rental_id))
+    await callback.answer()
+
+
+async def cb_pickup_cancel(callback: CallbackQuery):
+    data = callback.data or ""
+    if not data.startswith("pickup_cancel_"):
+        await callback.answer()
+        return
+    try:
+        rental_id = int(data.replace("pickup_cancel_", ""))
+    except ValueError:
+        await callback.answer("Xatolik.")
+        return
+    rental = db.get_rental(rental_id)
+    uid = callback.from_user.id if callback.from_user else 0
+    if not rental or int(rental.get("user_id") or 0) != int(uid):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    # Mark as rejected by user cancel (keeps history)
+    db.set_rental_status(rental_id, "rejected")
+    try:
+        await callback.message.edit_text("Bekor qilindi.")
+    except Exception:
+        await callback.message.answer("Bekor qilindi.")
+    await callback.answer()
+
+
+async def cb_pickup_slot(callback: CallbackQuery):
+    data = callback.data or ""
+    if not data.startswith("pickup_slot_"):
+        await callback.answer()
+        return
+    try:
+        _, _, rid_str, slot = data.split("_", 3)
+        rental_id = int(rid_str)
+    except Exception:
+        await callback.answer("Xatolik.")
+        return
+    rental = db.get_rental(rental_id)
+    uid = callback.from_user.id if callback.from_user else 0
+    if not rental or int(rental.get("user_id") or 0) != int(uid):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    # Normalize slot display
+    slot_map = {"10-12": "10:00–12:00", "12-14": "12:00–14:00", "14-16": "14:00–16:00"}
+    slot_txt = slot_map.get(slot, slot)
+    db.update_rental_schedule(rental_id, pickup_slot=slot_txt)
+
+    # Next step: payment selection will be implemented in payment task.
+    await callback.message.edit_text(
+        f"✅ Olib ketish vaqti belgilandi.\n"
+        f"📅 Sana: {(rental.get('pickup_date') or '—')}\n"
+        f"🕒 Vaqt: {slot_txt}\n\n"
+        "Keyingi qadam: to'lov (tez orada).",
+    )
+    await callback.answer()
 
 async def unknown_command_handler(message: Message):
     """Unknown commands (e.g. /random) -> friendly fallback."""
@@ -2564,7 +3014,6 @@ def setup_router(dp: Dispatcher) -> None:
 
     dp.message.register(cmd_start, CommandStart(), _PRIVATE)
     dp.message.register(cmd_admin, Command("admin"), _PRIVATE, AdminOnly())
-    dp.message.register(cmd_wipe_all, Command("wipe_all"), _PRIVATE, AdminOnly())
     dp.message.register(cmd_set_order, Command("set_order"), _PRIVATE, AdminOnly())
 
     # Main menu buttons (must be registered before any catch-all fallbacks)
@@ -2574,13 +3023,14 @@ def setup_router(dp: Dispatcher) -> None:
     # Admin ReplyKeyboard buttons
     dp.message.register(admin_add_book_msg, F.text == "➕ Kitob qo'shish", _PRIVATE, AdminOnly())
     dp.message.register(admin_books_msg, F.text == "📚 Kitoblarim", _PRIVATE, AdminOnly())
-    dp.message.register(admin_wipe_msg, F.text == "🧹 Tozalash", _PRIVATE, AdminOnly())
     dp.message.register(cmd_admin_rentals_msg, F.text == "📦 Ijaralar", _PRIVATE, AdminOnly())
     dp.message.register(admin_overdue_msg, F.text == "⏰ Kechikkanlar", _PRIVATE, AdminOnly())
     dp.message.register(admin_penalty_msg, F.text == "💰 Jarima", _PRIVATE, AdminOnly())
     dp.message.register(admin_stats_msg, F.text == "📊 Userlar statistikasi", _PRIVATE, AdminOnly())
     dp.message.register(admin_broadcast_msg, F.text == "📢 E'lon", _PRIVATE, AdminOnly())
     dp.message.register(admin_export_msg, F.text == "📤 Export", _PRIVATE, AdminOnly())
+    dp.message.register(admin_settings_msg, F.text == "⚙️ Sozlamalar", _PRIVATE, AdminOnly())
+    dp.message.register(admin_income_msg, F.text == "💰 Daromad", _PRIVATE, AdminOnly())
     dp.callback_query.register(cb_export_csv, F.data == "export_csv", AdminOnly())
     dp.callback_query.register(cb_export_json, F.data == "export_json", AdminOnly())
     dp.message.register(admin_broadcast_message, AdminBroadcastStates.message, _PRIVATE, AdminOnly())
@@ -2590,6 +3040,10 @@ def setup_router(dp: Dispatcher) -> None:
     dp.callback_query.register(cb_admin_stats_not_returned, F.data == "admin_stats_not_returned", AdminOnly())
     dp.callback_query.register(cb_admin_stats_blacklist, F.data == "admin_stats_blacklist", AdminOnly())
     dp.callback_query.register(cb_admin_stats_back, F.data == "admin_stats_back", AdminOnly())
+    dp.callback_query.register(cb_settings_edit, F.data.startswith("settings_edit_"), AdminOnly())
+    dp.message.register(admin_settings_save, AdminSettingsStates.address, _PRIVATE, AdminOnly())
+    dp.message.register(admin_settings_save, AdminSettingsStates.contact, _PRIVATE, AdminOnly())
+    dp.message.register(admin_settings_save, AdminSettingsStates.work_hours, _PRIVATE, AdminOnly())
     dp.message.register(admin_penalty_amount, AdminPenaltyStates.amount, _PRIVATE, AdminOnly())
 
     # Add book FSM
@@ -2604,8 +3058,6 @@ def setup_router(dp: Dispatcher) -> None:
     dp.message.register(add_book_qty, AddBookStates.qty, _PRIVATE, AdminOnly())
     dp.callback_query.register(add_book_rent_fee_quick, AddBookStates.rent_fee, F.data.startswith("add_rent_"), AdminOnly())
     dp.message.register(add_book_rent_fee, AddBookStates.rent_fee, _PRIVATE, AdminOnly())
-    dp.callback_query.register(add_book_deposit_skip, AddBookStates.deposit, F.data == "add_deposit_skip", AdminOnly())
-    dp.message.register(add_book_deposit, AddBookStates.deposit, _PRIVATE, AdminOnly())
     dp.message.register(add_book_photo, AddBookStates.photo, _PRIVATE, AdminOnly(), F.photo)
     dp.callback_query.register(add_book_photo_skip, AddBookStates.photo, F.data == "add_book_photo_skip", AdminOnly())
     dp.message.register(add_book_photo_reject, AddBookStates.photo, _PRIVATE, AdminOnly(), ~F.photo)
@@ -2620,11 +3072,9 @@ def setup_router(dp: Dispatcher) -> None:
     dp.message.register(edit_book_photo_reject, EditBookStates.photo, _PRIVATE, AdminOnly(), ~F.photo)
 
     # Admin callbacks
-    dp.callback_query.register(cb_admin_wipe, F.data == "admin_wipe", AdminOnly())
-    dp.callback_query.register(cb_wipe_confirm, F.data == "wipe_confirm", AdminOnly())
-    dp.callback_query.register(cb_wipe_cancel, F.data == "wipe_cancel", AdminOnly())
     dp.callback_query.register(cb_admin_books, F.data == "admin_books", AdminOnly())
     dp.callback_query.register(cb_admin_books_page, F.data.startswith("admin_books_p_"), AdminOnly())
+    dp.callback_query.register(cb_admin_book_detail, F.data.startswith("admin_book_"), AdminOnly())
     dp.callback_query.register(cb_admin_books_filter_search, F.data == "admin_books_filter_search", AdminOnly())
     dp.callback_query.register(cb_admin_books_filter_cat, F.data == "admin_books_filter_cat", AdminOnly())
     dp.callback_query.register(cb_admin_books_filter_cat_sel, F.data.startswith("admin_books_cat_"), AdminOnly())
@@ -2632,6 +3082,7 @@ def setup_router(dp: Dispatcher) -> None:
     dp.callback_query.register(cb_admin_books_filter_clear, F.data == "admin_books_filter_clear", AdminOnly())
     dp.message.register(admin_books_search_query, AdminBooksFilterStates.search_query, _PRIVATE, AdminOnly())
     dp.callback_query.register(cb_admin_del_confirm, F.data.startswith("admin_del_confirm_"), AdminOnly())
+    dp.callback_query.register(cb_admin_del_cancel, F.data.startswith("admin_del_cancel_"), AdminOnly())
     dp.callback_query.register(cb_admin_del_book, F.data.startswith("admin_del_"), AdminOnly())
     dp.callback_query.register(cb_admin_edit, F.data.startswith("admin_edit_"), AdminOnly())
     dp.callback_query.register(cb_edit_field, F.data.startswith("edit_field_"), AdminOnly())
@@ -2663,8 +3114,12 @@ def setup_router(dp: Dispatcher) -> None:
     dp.callback_query.register(cb_books_sort, F.data.startswith("books_sort:"))
     dp.callback_query.register(cb_sort_sel, F.data.startswith("sort_sel:"))
     dp.callback_query.register(cb_books_search_start, F.data == "books_search")
-    dp.callback_query.register(cb_rent_book, (F.data.startswith("rent_") | F.data.startswith("book_")))
+    dp.callback_query.register(cb_books_page_simple, F.data.startswith("books_page_"))
+    dp.callback_query.register(cb_books_list_back, F.data == "books_list_back")
+    dp.callback_query.register(cb_book_detail, F.data.startswith("book_"))
+    dp.callback_query.register(cb_rent_book, F.data.startswith("rent_"))
     dp.callback_query.register(cb_rental_period, F.data.startswith("period_"))
+    dp.callback_query.register(cb_rental_payment_method, F.data.startswith("paym_"))
     dp.callback_query.register(cb_books_back, F.data == "books_back")
     dp.callback_query.register(cb_noop, F.data == "noop")
 
@@ -2694,7 +3149,8 @@ async def main():
         )
 
     create_lock()
-    logger.info("Starting bot process. Admins: %s", ADMIN_IDS)
+    # Don't log admin IDs in production logs.
+    logger.info("Starting bot process.")
 
     db.init_db()
 
@@ -2706,13 +3162,29 @@ async def main():
         logger.exception("Failed to create Bot object (token validation error)")
         raise
 
-    await bot.delete_webhook(drop_pending_updates=True)
     try:
+        # 1) Validate token early
         me = await bot.get_me()
         logger.info("Bot ready: id=%s, username=@%s", me.id, me.username)
+
+        # 2) Ensure polling works (remove any webhook)
+        await bot.delete_webhook(drop_pending_updates=True)
+
+    except TelegramUnauthorizedError:
+        logger.error("BOT_TOKEN invalid/revoked (Unauthorized). Paste the NEW token into .env and restart.")
+        await bot.session.close()
+        raise SystemExit(1)
+
+    except TelegramNetworkError as e:
+        logger.error("Network error contacting Telegram API: %s", e)
+        logger.error("If ping/curl works but aiogram fails, try restarting PC/router or changing DNS to 8.8.8.8 / 1.1.1.1.")
+        await bot.session.close()
+        raise SystemExit(1)
+
     except Exception as e:
-        logger.error("get_me failed: %s: %s", type(e).__name__, e)
-        raise
+        logger.exception("Startup failed with unexpected error: %s", e)
+        await bot.session.close()
+        raise SystemExit(1)
 
     dp = Dispatcher()
     dp.update.outer_middleware(_log_incoming_update)
@@ -2721,17 +3193,23 @@ async def main():
     if REMINDERS_ENABLED:
         asyncio.create_task(reminder_loop(bot))
 
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        try:
+            await bot.session.close()
+        except Exception:
+            pass
 
 
 # ====== Admin security self-test checklist ======
 # Run these manually to verify admin protection:
 # 1. Non-admin: /admin -> "Bu buyruq faqat admin uchun."
-# 2. Non-admin: /wipe_all, /set_order -> same message
+# 2. Non-admin: /set_order -> same message
 # 3. Non-admin: tap admin_back, admin_books, admin_del_*, rental_ok_*, rental_no_* -> "Ruxsat yo'q." alert
 # 4. Non-admin: cannot complete add_book FSM (each step blocked)
 # 5. Admin: all above actions work normally
-# Secured handlers: cmd_admin, cmd_wipe_all, cmd_set_order, cb_admin_add_book,
+# Secured handlers: cmd_admin, cmd_set_order, cb_admin_add_book,
 #   add_book_* (FSM), cb_admin_books, cb_admin_books_page,
 #   cb_admin_del_book, cb_admin_rentals, cb_rental_ok, cb_rental_no, cb_admin_back
 

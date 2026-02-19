@@ -90,6 +90,17 @@ def _migrate_rentals_schema(conn: sqlite3.Connection) -> None:
         ("returned_at", "ALTER TABLE rentals ADD COLUMN returned_at TEXT NULL"),
         ("closed_by_admin_id", "ALTER TABLE rentals ADD COLUMN closed_by_admin_id INTEGER NULL"),
         ("approved_by_admin_id", "ALTER TABLE rentals ADD COLUMN approved_by_admin_id INTEGER NULL"),
+        ("payment_method", "ALTER TABLE rentals ADD COLUMN payment_method TEXT DEFAULT NULL"),
+        ("payment_status", "ALTER TABLE rentals ADD COLUMN payment_status TEXT NOT NULL DEFAULT 'pending'"),
+        ("paid_at", "ALTER TABLE rentals ADD COLUMN paid_at TEXT DEFAULT NULL"),
+        ("payment_proof_file_id", "ALTER TABLE rentals ADD COLUMN payment_proof_file_id TEXT DEFAULT NULL"),
+        ("payment_confirmed_at", "ALTER TABLE rentals ADD COLUMN payment_confirmed_at TEXT DEFAULT NULL"),
+        ("payment_confirmed_by", "ALTER TABLE rentals ADD COLUMN payment_confirmed_by INTEGER DEFAULT NULL"),
+        ("pickup_date", "ALTER TABLE rentals ADD COLUMN pickup_date TEXT DEFAULT NULL"),
+        ("pickup_slot", "ALTER TABLE rentals ADD COLUMN pickup_slot TEXT DEFAULT NULL"),
+        ("period_days", "ALTER TABLE rentals ADD COLUMN period_days INTEGER NOT NULL DEFAULT 0"),
+        ("rent_fee_total", "ALTER TABLE rentals ADD COLUMN rent_fee_total INTEGER NOT NULL DEFAULT 0"),
+        ("rejected_reason", "ALTER TABLE rentals ADD COLUMN rejected_reason TEXT DEFAULT NULL"),
         ("penalty_enabled", "ALTER TABLE rentals ADD COLUMN penalty_enabled INTEGER NOT NULL DEFAULT 1"),
         ("penalty_per_day", "ALTER TABLE rentals ADD COLUMN penalty_per_day INTEGER NOT NULL DEFAULT 0"),
         ("penalty_fixed", "ALTER TABLE rentals ADD COLUMN penalty_fixed INTEGER NULL"),
@@ -205,6 +216,17 @@ def _create_settings_table(conn: sqlite3.Connection) -> None:
     cur = conn.execute("SELECT value FROM bot_settings WHERE key = 'penalty_per_day'")
     if cur.fetchone() is None:
         conn.execute("INSERT INTO bot_settings (key, value) VALUES ('penalty_per_day', '2000')")
+    # Shop settings defaults
+    for k, v in [
+        ("address", ""),
+        ("contact", ""),
+        ("work_hours", ""),
+        ("click_link", ""),
+        ("payme_link", ""),
+    ]:
+        cur = conn.execute("SELECT value FROM bot_settings WHERE key = ?", (k,))
+        if cur.fetchone() is None:
+            conn.execute("INSERT INTO bot_settings (key, value) VALUES (?, ?)", (k, v))
     conn.commit()
 
 
@@ -245,6 +267,9 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rentals_book_status ON rentals(book_id, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rentals_user_id ON rentals(user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rentals_due_ts ON rentals(due_ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rentals_status_created ON rentals(status, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rentals_payment_status ON rentals(payment_status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rentals_payment_confirmed_at ON rentals(payment_confirmed_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_books_category ON books(category)")
         conn.commit()
     finally:
@@ -298,6 +323,7 @@ SORT_NEWEST = "newest"
 SORT_AUTHOR = "author"
 SORT_CATEGORY = "category"
 SORT_MANUAL = "manual"
+SORT_TITLE = "title"
 
 
 def list_books(
@@ -323,6 +349,8 @@ def list_books(
             sql += " WHERE " + " AND ".join(where)
         if sort_mode == SORT_NEWEST:
             sql += " ORDER BY COALESCE(year, 0) DESC, title ASC"
+        elif sort_mode == SORT_TITLE:
+            sql += " ORDER BY title ASC"
         elif sort_mode == SORT_AUTHOR:
             sql += " ORDER BY author ASC, title ASC"
         elif sort_mode == SORT_CATEGORY:
@@ -506,14 +534,30 @@ def update_book(
 
 
 def delete_book(book_id: int) -> bool:
-    """Delete book. Returns False if book has active rentals. Does not delete."""
+    """Delete book. Returns False if book has active rentals.
+
+    With foreign_keys=ON, deleting a book referenced by rentals will fail unless
+    related rentals are removed first. We keep active rentals protected and
+    remove only non-active rentals for the book before deleting it.
+    """
     if has_active_rentals(book_id):
         return False
     conn = _get_conn()
     try:
+        # Remove non-active rentals to satisfy FK integrity.
+        conn.execute(
+            "DELETE FROM rentals WHERE book_id = ? AND status NOT IN ('approved', 'active')",
+            (book_id,),
+        )
         cur = conn.execute("DELETE FROM books WHERE id = ?", (book_id,))
         conn.commit()
         return cur.rowcount > 0
+    except sqlite3.IntegrityError:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
     finally:
         conn.close()
 
@@ -538,18 +582,86 @@ def get_categories_for_add() -> list[str]:
     return base + ["Boshqa"] if "Boshqa" not in base else base
 
 
-def create_rental_request(user_id: int, book_id: int, due_ts: str) -> int:
+def create_rental_request(
+    user_id: int,
+    book_id: int,
+    due_ts: str,
+    *,
+    period_days: int = 0,
+    rent_fee_total: int = 0,
+    payment_method: Optional[str] = None,
+) -> int:
     """Create rental with status=requested. Returns rental id."""
     conn = _get_conn()
     try:
+        pm = (payment_method or "").strip().lower() or None
         cur = conn.execute(
-            "INSERT INTO rentals (user_id, book_id, status, due_ts, created_at) VALUES (?, ?, ?, ?, ?)",
-            (user_id, book_id, "requested", due_ts, datetime.now().isoformat()),
+            "INSERT INTO rentals (user_id, book_id, status, due_ts, created_at, period_days, rent_fee_total, payment_method) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                user_id,
+                book_id,
+                "requested",
+                due_ts,
+                datetime.now().isoformat(),
+                max(0, int(period_days or 0)),
+                max(0, int(rent_fee_total or 0)),
+                pm,
+            ),
         )
         conn.commit()
         return cur.lastrowid
     finally:
         conn.close()
+
+
+def update_rental_schedule(rental_id: int, *, pickup_date: Optional[str] = None, pickup_slot: Optional[str] = None) -> bool:
+    """Update pickup_date/pickup_slot for rental."""
+    updates = []
+    params: list[Any] = []
+    if pickup_date is not None:
+        updates.append("pickup_date = ?")
+        params.append(pickup_date)
+    if pickup_slot is not None:
+        updates.append("pickup_slot = ?")
+        params.append(pickup_slot)
+    if not updates:
+        return False
+    params.append(rental_id)
+
+    def _op() -> bool:
+        conn = _get_conn()
+        try:
+            cur = conn.execute(
+                f"UPDATE rentals SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    return bool(_write_retry(_op))
+
+
+def update_rental_period_and_total(rental_id: int, *, period_days: int, rent_fee_total: int) -> bool:
+    """Store chosen rental period days and computed total fee."""
+    period_days = max(0, int(period_days or 0))
+    rent_fee_total = max(0, int(rent_fee_total or 0))
+
+    def _op() -> bool:
+        conn = _get_conn()
+        try:
+            cur = conn.execute(
+                "UPDATE rentals SET period_days = ?, rent_fee_total = ? WHERE id = ?",
+                (period_days, rent_fee_total, rental_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    return bool(_write_retry(_op))
 
 
 def list_rentals(status: Optional[str] = None) -> list[dict[str, Any]]:
@@ -583,6 +695,77 @@ def get_rental(rental_id: int) -> Optional[dict[str, Any]]:
         )
         row = cur.fetchone()
         return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_setting(key: str) -> str:
+    conn = _get_conn()
+    try:
+        cur = conn.execute("SELECT value FROM bot_settings WHERE key = ?", (key,))
+        row = cur.fetchone()
+        return str(row[0]) if row and row[0] is not None else ""
+    finally:
+        conn.close()
+
+
+def set_setting(key: str, value: str) -> bool:
+    key = (key or "").strip()
+    if not key:
+        return False
+    value = value if value is not None else ""
+
+    def _op() -> bool:
+        conn = _get_conn()
+        try:
+            conn.execute(
+                "INSERT INTO bot_settings(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    return bool(_write_retry(_op))
+
+
+def get_shop_settings() -> dict[str, str]:
+    return {
+        "address": get_setting("address"),
+        "contact": get_setting("contact"),
+        "work_hours": get_setting("work_hours"),
+        "click_link": get_setting("click_link"),
+        "payme_link": get_setting("payme_link"),
+    }
+
+
+def revenue_summary(start_date: str, end_date: str) -> dict[str, int]:
+    """Revenue summary by created_at date range (inclusive), UTC dates YYYY-MM-DD.
+
+    Returns: {"rental_count": int, "rent_fee_sum": int}
+    rental_count counts rentals with status IN ('approved','active','returned').
+    rent_fee_sum is SUM(books.rent_fee) for those rentals.
+    """
+    start_date = (start_date or "")[:10]
+    end_date = (end_date or "")[:10]
+    if not start_date or not end_date:
+        return {"rental_count": 0, "rent_fee_sum": 0}
+    conn = _get_conn()
+    try:
+        cur = conn.execute(
+            "SELECT COUNT(*) AS rental_count, COALESCE(SUM(b.rent_fee), 0) AS rent_fee_sum "
+            "FROM rentals r JOIN books b ON r.book_id = b.id "
+            "WHERE r.status IN ('approved','active','returned') "
+            "AND substr(r.created_at, 1, 10) >= ? AND substr(r.created_at, 1, 10) <= ?",
+            (start_date, end_date),
+        )
+        row = cur.fetchone()
+        return {
+            "rental_count": int(row["rental_count"] or 0),
+            "rent_fee_sum": int(row["rent_fee_sum"] or 0),
+        }
     finally:
         conn.close()
 
@@ -885,6 +1068,87 @@ def close_rental_returned(rental_id: int, admin_id: int) -> bool:
                 "UPDATE rentals SET status = 'returned', returned_at = ?, closed_by_admin_id = ? "
                 "WHERE id = ? AND status IN ('approved', 'active')",
                 (datetime.now(timezone.utc).isoformat(), admin_id, rental_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    return bool(_write_retry(_op))
+
+
+def set_rental_payment_method(rental_id: int, method: str) -> bool:
+    """User chooses payment method for an approved rental (cash/card)."""
+    method_norm = (method or "").strip().lower()
+    if method_norm not in ("cash", "card"):
+        return False
+
+    def _op() -> bool:
+        conn = _get_conn()
+        try:
+            cur = conn.execute(
+                "UPDATE rentals SET payment_method = ?, payment_status = 'pending', paid_at = NULL "
+                "WHERE id = ? AND status = 'approved' AND payment_status = 'pending'",
+                (method_norm, rental_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    return bool(_write_retry(_op))
+
+
+def reset_rental_payment(rental_id: int) -> bool:
+    """Reset payment selection for an approved rental."""
+    def _op() -> bool:
+        conn = _get_conn()
+        try:
+            cur = conn.execute(
+                "UPDATE rentals SET payment_method = NULL, payment_status = 'pending', paid_at = NULL "
+                "WHERE id = ? AND status = 'approved' AND payment_status = 'pending'",
+                (rental_id,),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    return bool(_write_retry(_op))
+
+
+def confirm_rental_payment(rental_id: int, admin_id: int) -> bool:
+    """Admin confirms payment: marks paid + activates rental."""
+    def _op() -> bool:
+        conn = _get_conn()
+        try:
+            cur = conn.execute(
+                "UPDATE rentals "
+                "SET payment_status = 'paid', paid_at = ?, status = 'active' "
+                "WHERE id = ? "
+                "AND status = 'approved' "
+                "AND payment_status = 'pending' "
+                "AND payment_method IN ('cash', 'card')",
+                (datetime.now(timezone.utc).isoformat(), rental_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    return bool(_write_retry(_op))
+
+
+def reject_rental_payment(rental_id: int, admin_id: int) -> bool:
+    """Admin rejects payment: keeps rental approved, resets payment fields."""
+    def _op() -> bool:
+        conn = _get_conn()
+        try:
+            cur = conn.execute(
+                "UPDATE rentals "
+                "SET payment_method = NULL, payment_status = 'pending', paid_at = NULL "
+                "WHERE id = ? AND status = 'approved' AND payment_status = 'pending'",
+                (rental_id,),
             )
             conn.commit()
             return cur.rowcount > 0
