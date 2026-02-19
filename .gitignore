@@ -21,6 +21,10 @@ venv/
 *.log
 logs/
 
+# Legacy JSON exports (SQLite is used now)
+books.json
+rentals.json
+
 # OS / IDE
 .DS_Store
 Thumbs.db
